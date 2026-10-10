@@ -72,6 +72,14 @@ choisis si l'adresse demandée figure dans leurs `hostnames`
      **`transfer`** (natif depuis Minecraft 1.20.5) vers la même adresse. Le
      client se reconnecte tout seul et tombe cette fois sur le vrai serveur.
 
+### État publié pour les autres outils
+
+À chaque changement, le réveilleur écrit `/run/reveilleur/<serveur>.json`
+(`{"state": "veille" | "demarrage" | "pret", "estimate": <s>, "since": <horodatage>}`,
+dossier créé par systemd via `RuntimeDirectory=reveilleur`). Le statut Discord
+(`discord-status`) et l'API du panel (`/api/status`, champ `state`) s'en servent
+pour afficher « En veille » au lieu de « Hors ligne ».
+
 ### Joueurs Bedrock et versions inconnues
 
 Un client Bedrock (via Geyser) ou un client dont la version n'est pas dans

@@ -151,6 +151,29 @@ fn log(msg: impl AsRef<str>) {
     eprintln!("{}", msg.as_ref());
 }
 
+/// Dossier où l'état de chaque serveur est publié pour les autres outils
+/// (statut Discord, API du panel) : `/run/reveilleur/<nom>.json`.
+const STATE_DIR: &str = "/run/reveilleur";
+
+/// Publie l'état d'un serveur (« veille », « demarrage » ou « pret ») si il a changé.
+fn publish_state(srv: &Server, last: &mut String, state: &str) {
+    let est = srv.estimate.load(Ordering::SeqCst);
+    let key = format!("{state}/{est}");
+    if *last == key {
+        return;
+    }
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let json = serde_json::json!({"state": state, "estimate": est, "since": since});
+    let path = format!("{STATE_DIR}/{}.json", srv.cfg.name);
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, json.to_string()).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
+        *last = key;
+    }
+}
+
 fn load_history(path: &str) -> Vec<u64> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -705,12 +728,15 @@ fn supervisor(
     let mut last_error_log: Option<Instant> = None;
     // Arrêt pour inactivité en cours : une fois Minecraft arrêté, on éteint le conteneur.
     let mut idle_stopped = false;
+    let mut published = String::new();
     loop {
         let waking = srv.wake.load(Ordering::SeqCst);
         if waking {
             idle_stopped = false;
         }
-        match amp.state() {
+        let res = amp.state();
+        let last_amp_state = res.as_ref().ok().copied();
+        match res {
             Ok(st) => {
                 if idle_stopped && st == 0 {
                     idle_stopped = false;
@@ -791,6 +817,20 @@ fn supervisor(
                 }
             }
         }
+        // État publié : prêt, en cours de démarrage (réveil demandé ou démarrage manuel), ou en veille.
+        let state = if *ready_tx.borrow() {
+            "pret"
+        } else if srv.wake.load(Ordering::SeqCst)
+            || ready_since.is_some()
+            // 5 = PreStart, 7 = Configuring, 10 = Starting, 30 = Restarting
+            || matches!(last_amp_state, Some(5 | 7 | 10 | 30))
+        {
+            "demarrage"
+        } else {
+            "veille"
+        };
+        publish_state(&srv, &mut published, state);
+
         // Au repos on vérifie toutes les 10 s, mais une demande de réveil interrompt l'attente.
         let pause = if srv.wake.load(Ordering::SeqCst) { 1 } else { 10 };
         let _ = nudge.recv_timeout(Duration::from_secs(pause));
