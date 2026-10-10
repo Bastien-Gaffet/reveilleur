@@ -1,0 +1,15 @@
+[Unit]
+Description=PicoLimbo - salle d attente du serveur Les coccinelles
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/picolimbo/coccinelles
+ExecStart=/opt/picolimbo/pico_limbo --skip-banner -c server.toml
+Restart=always
+RestartSec=5
+DynamicUser=yes
+MemoryMax=64M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

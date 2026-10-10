@@ -1,0 +1,11 @@
+target/
+__pycache__/
+*.pyc
+venv/
+.env
+*.env
+!*.env.example
+bot.token
+admin.token
+amp-password
+*.bak*

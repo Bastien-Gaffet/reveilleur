@@ -1,0 +1,13 @@
+[Unit]
+Description=Reveilleur du serveur Les coccinelles (veille + limbo + transfert)
+After=network.target picolimbo-coccinelles.service
+Wants=picolimbo-coccinelles.service
+
+[Service]
+ExecStart=/usr/local/bin/reveilleur /etc/reveilleur/coccinelles.toml
+Restart=always
+RestartSec=5
+MemoryMax=32M
+
+[Install]
+WantedBy=multi-user.target

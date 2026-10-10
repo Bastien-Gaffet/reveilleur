@@ -1,0 +1,20 @@
+[package]
+name = "reveilleur"
+version = "0.1.0"
+edition = "2021"
+description = "Proxy Minecraft minimaliste : réveille un serveur AMP endormi, fait patienter dans un limbo, puis transfère le joueur."
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", default-features = false, features = ["json"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
