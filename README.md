@@ -105,7 +105,9 @@ réveilleur déclenche le réveil et le déconnecte avec « Le serveur X démarr
 
 `deploy/reveilleur.toml.example` (sur le VPS : `/etc/reveilleur/reveilleur.toml`).
 
-Global : `limbo`, `ads_url`, `amp_user`, `amp_password_file`, et
+Global : `limbo`, `ads_url`, `amp_user`, `amp_password_file`, `protocols_file`
+(fichier complémentaire relu à chaud sur `SIGHUP`, alimenté par
+`reveilleur-maj`), et
 `[protocols."<n°>"]` (numéros des paquets `transfer` et `system_chat`).
 
 Par serveur (`[[servers]]`) :
@@ -173,7 +175,28 @@ joueurs masquée, compression désactivée, message d'accueil générique).
 - **Seed par défaut d'AMP** : « CubeCodersPowered », la même pour toutes les
   instances. À changer via `MinecraftModule.Minecraft.WorldSeed`.
 
+## Mise à jour assistée (`deploy/reveilleur-maj`)
+
+Toutes les 5 minutes (`reveilleur-maj.timer`), l'outil :
+
+1. lit la version de Minecraft de chaque serveur (jar en cache) ; si son
+   protocole est inconnu, génère les rapports officiels du jar, en extrait les
+   numéros de `transfer` et `system_chat`, vérifie que `login_finished` (2) et
+   `finish_configuration` (3) n'ont pas changé, dépose une **proposition** et
+   prévient sur Discord ;
+2. en jeu, PcsiAdmin la présente aux opérateurs avec **[Valider]** / **[Refuser]** ;
+3. une fois validée, l'outil l'ajoute à `/etc/reveilleur/protocols.toml` et envoie
+   `SIGHUP` au réveilleur, qui **recharge les numéros à chaud** (personne n'est
+   coupé), puis met PicoLimbo à jour si sa dernière version annonce la nouvelle
+   version de Minecraft (remplacement atomique du binaire).
+
+L'outil est idempotent : une exécution interrompue peut être relancée sans
+doublon. Testé de bout en bout le 2026-10-10 : protocole 777 retiré puis
+redécouvert, validé et rechargé ; PicoLimbo passé de 1.14.1 à 1.15.0.
+
 ## Entretien à chaque nouvelle version de Minecraft
+
+Normalement automatique (voir ci-dessus). À la main si besoin :
 
 1. Récupérer les nouveaux numéros de paquets depuis le jar du serveur :
    ```bash
@@ -197,9 +220,3 @@ cp deploy/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now picolimbo reveilleur
 ```
-
-## Feuille de route
-
-- **Mise à jour assistée des numéros de paquets** : détection d'une nouvelle
-  version, extraction automatique depuis le jar, puis validation par un
-  opérateur via une commande en jeu.

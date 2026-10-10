@@ -3,11 +3,9 @@ limbo = "127.0.0.1:30066"
 ads_url = "http://127.0.0.1:8080/API/"
 amp_user = "reveilleur"
 amp_password_file = "/etc/reveilleur/amp-password"
+protocols_file = "/etc/reveilleur/protocols.toml"
 
 # Paquets clientbound play par protocole (packets.json du serveur).
-[protocols."777"]   # 26.3
-transfer = 132
-system_chat = 124
 
 [protocols."776"]   # 26.2
 transfer = 129

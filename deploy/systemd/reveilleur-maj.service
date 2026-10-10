@@ -1,0 +1,6 @@
+[Unit]
+Description=Mise à jour assistée des numéros de paquets du réveilleur
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/reveilleur-maj

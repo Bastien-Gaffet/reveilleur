@@ -1,0 +1,5 @@
+# Numéros de paquets ajoutés par reveilleur-maj après validation en jeu.
+
+[protocols."777"]   # 26.3, validé en jeu par Rcon le 2026-10-10
+transfer = 132
+system_chat = 124

@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Mise à jour assistée des numéros de paquets du réveilleur.
+
+Lancé toutes les 5 minutes (reveilleur-maj.timer) :
+
+1. Pour chaque serveur, lit la version de Minecraft dans le jar en cache
+   (cache/mojang_<version>.jar, version.json). Si son protocole est inconnu du
+   réveilleur, génère les rapports officiels du jar (packets.json), en extrait
+   les numéros des paquets `transfer` et `system_chat`, vérifie les deux
+   numéros utilisés pour suivre la connexion (login_finished = 2,
+   finish_configuration = 3) et dépose une PROPOSITION :
+     - /var/lib/reveilleur/propositions/<protocole>.json
+     - plugins/PcsiAdmin/reveilleur-proposition.json (affichée en jeu aux opérateurs)
+   puis prévient sur Discord.
+2. Si un opérateur a cliqué [Valider] en jeu (PcsiAdmin écrit
+   plugins/PcsiAdmin/reveilleur-decision.json), ajoute les numéros à
+   /etc/reveilleur/protocols.toml, recharge le réveilleur à chaud (SIGHUP, personne
+   n'est coupé), met PicoLimbo à jour si une version plus récente existe, et
+   confirme sur Discord. [Refuser] range la proposition sans rien appliquer.
+
+Règle d'architecture respectée : le jeu n'exécute rien sur l'hôte, il dépose
+seulement un fichier que ce script lit.
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.request
+import zipfile
+
+INSTANCES = "/home/amp/.ampdata/instances"
+CONFIG = "/etc/reveilleur/reveilleur.toml"
+PROTOCOLES = "/etc/reveilleur/protocols.toml"
+ETAT = "/var/lib/reveilleur/propositions"
+PCSI = f"{INSTANCES}/PCSI201/Minecraft/plugins/PcsiAdmin"
+JAVA = "/opt/jdk25/bin/java"
+PICOLIMBO = "/opt/picolimbo/pico_limbo"
+UA = "PcsiBot/1.0 (+https://pcsi-panel.duckdns.org)"
+
+
+def log(m):
+    print(time.strftime("%F %T"), m, flush=True)
+
+
+def discord(texte):
+    try:
+        cfg = json.load(open("/etc/discord-bot/config.json"))
+        token = open("/etc/discord-bot/bot.token").read().strip()
+        req = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{cfg['log_channel_id']}/messages",
+            data=json.dumps({"content": texte[:1900], "allowed_mentions": {"parse": []}}).encode(),
+            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json", "User-Agent": UA},
+            method="POST")
+        urllib.request.urlopen(req, timeout=15).read()
+    except OSError as e:
+        log(f"Discord injoignable : {e}")
+
+
+def protocoles_connus():
+    connus = set()
+    for f in (CONFIG, PROTOCOLES):
+        try:
+            connus |= set(tomllib.load(open(f, "rb")).get("protocols", {}))
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    return connus
+
+
+def jar_actuel(instance):
+    """Jar vanilla en cache le plus récent de l'instance (hors versions de test)."""
+    jars = [j for j in glob.glob(f"{INSTANCES}/{instance}/Minecraft/cache/mojang_*.jar")
+            if not re.search(r"-(rc|pre)-?\d", j)]
+    return max(jars, key=os.path.getmtime) if jars else None
+
+
+def version_du_jar(jar):
+    with zipfile.ZipFile(jar) as z:
+        v = json.loads(z.read("version.json"))
+    return v["id"], str(v["protocol_version"])
+
+
+def numeros(jar):
+    """Génère packets.json depuis le jar et renvoie les numéros utiles."""
+    tmp = tempfile.mkdtemp(prefix="reveilleur-maj-")
+    try:
+        shutil.copy(jar, f"{tmp}/server.jar")
+        subprocess.run(["nice", "-n", "19", JAVA, "-DbundlerMainClass=net.minecraft.data.Main",
+                        "-jar", "server.jar", "--reports"], cwd=tmp, capture_output=True, timeout=900)
+        p = json.load(open(f"{tmp}/generated/reports/packets.json"))
+        return {
+            "transfer": p["play"]["clientbound"]["minecraft:transfer"]["protocol_id"],
+            "system_chat": p["play"]["clientbound"]["minecraft:system_chat"]["protocol_id"],
+            "login_finished": p["login"]["clientbound"]["minecraft:login_finished"]["protocol_id"],
+            "finish_configuration": p["configuration"]["clientbound"]["minecraft:finish_configuration"]["protocol_id"],
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def detecter():
+    os.makedirs(ETAT, exist_ok=True)
+    connus = protocoles_connus()
+    for inst in sorted(os.listdir(INSTANCES)):
+        jar = jar_actuel(inst)
+        if not jar:
+            continue
+        version, proto = version_du_jar(jar)
+        if proto in connus or glob.glob(f"{ETAT}/{proto}.*"):
+            continue  # déjà connu, proposé, refusé ou appliqué
+        log(f"{inst} : Minecraft {version} (protocole {proto}) inconnu, génération des rapports...")
+        n = numeros(jar)
+        coherent = n["login_finished"] == 2 and n["finish_configuration"] == 3
+        prop = {"version": version, "protocol": proto, "instance": inst, "transfer": n["transfer"],
+                "system_chat": n["system_chat"], "coherent": coherent, "date": int(time.time())}
+        if not coherent:
+            prop["avertissement"] = ("login_finished ou finish_configuration a changé : le suivi de connexion du "
+                                     "réveilleur doit être adapté dans le code avant de valider.")
+        json.dump(prop, open(f"{ETAT}/{proto}.json", "w"), indent=2)
+        if os.path.isdir(PCSI):
+            json.dump(prop, open(f"{PCSI}/reveilleur-proposition.json", "w"), indent=2, ensure_ascii=False)
+            shutil.chown(f"{PCSI}/reveilleur-proposition.json", "amp", "amp")
+        discord(f"**Réveilleur** : nouvelle version détectée sur {inst}, Minecraft {version} (protocole {proto}). "
+                f"Numéros proposés : transfer = {n['transfer']}, system_chat = {n['system_chat']}"
+                + ("" if coherent else f". ATTENTION : {prop['avertissement']}")
+                + ". À valider en jeu par un opérateur (message cliquable à la connexion).")
+        log(f"proposition déposée : {prop}")
+
+
+def maj_picolimbo(version):
+    """Remplace PicoLimbo si la dernière version publiée annonce la version demandée."""
+    try:
+        r = json.load(urllib.request.urlopen(urllib.request.Request(
+            "https://api.github.com/repos/Quozul/PicoLimbo/releases/latest", headers={"User-Agent": UA}), timeout=20))
+    except OSError as e:
+        return f"vérification PicoLimbo impossible ({e})"
+    actuelle = subprocess.run([PICOLIMBO, "--version"], capture_output=True, text=True).stdout.strip()
+    tag = r["tag_name"]
+    if tag.lstrip("v").split("+")[0] in actuelle:
+        return f"PicoLimbo déjà à jour ({actuelle})"
+    if f"mc{version}" not in tag:
+        return f"PicoLimbo {tag} n'annonce pas encore Minecraft {version} : mise à jour à faire plus tard"
+    asset = next((a for a in r["assets"] if a["name"] == "pico_limbo_linux-x86_64-musl.tar.gz"), None)
+    if not asset:
+        return "archive PicoLimbo introuvable"
+    tmp = tempfile.mkdtemp()
+    try:
+        archive = f"{tmp}/p.tgz"
+        urllib.request.urlretrieve(asset["browser_download_url"], archive)
+        subprocess.run(["tar", "xzf", archive, "-C", tmp], check=True)
+        shutil.copy(PICOLIMBO, PICOLIMBO + ".bak")
+        # Remplacement atomique par renommage : un binaire en cours d'exécution ne peut
+        # pas être réécrit sur place (« Text file busy »).
+        neuf = PICOLIMBO + ".neuf"
+        shutil.copy(f"{tmp}/pico_limbo", neuf)
+        os.chmod(neuf, 0o755)
+        os.replace(neuf, PICOLIMBO)
+        subprocess.run(["systemctl", "restart", "picolimbo"], check=True)
+        return f"PicoLimbo mis à jour vers {tag}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def appliquer():
+    fichier = f"{PCSI}/reveilleur-decision.json"
+    if not os.path.exists(fichier):
+        return
+    try:
+        d = json.load(open(fichier))
+        proto = str(d["protocol"])
+        prop = json.load(open(f"{ETAT}/{proto}.json"))
+    except (OSError, ValueError, KeyError) as e:
+        log(f"décision illisible ou sans proposition : {e}")
+        os.remove(fichier)
+        return
+    par = d.get("par", "?")
+    if d.get("decision") == "valider" and prop.get("coherent"):
+        # Idempotent : si une exécution précédente a été interrompue après l'ajout,
+        # on ne l'ajoute pas une seconde fois.
+        if proto not in protocoles_connus():
+            with open(PROTOCOLES, "a") as f:
+                f.write(f'\n[protocols."{proto}"]   # {prop["version"]}, validé en jeu par {par} le '
+                        f'{time.strftime("%Y-%m-%d")}\ntransfer = {prop["transfer"]}\nsystem_chat = {prop["system_chat"]}\n')
+        subprocess.run(["systemctl", "kill", "-s", "HUP", "reveilleur"])
+        limbo = maj_picolimbo(prop["version"])
+        os.rename(f"{ETAT}/{proto}.json", f"{ETAT}/{proto}.applique")
+        discord(f"**Réveilleur** : protocole {proto} (Minecraft {prop['version']}) validé par {par} et appliqué "
+                f"sans redémarrage. {limbo}.")
+        log(f"protocole {proto} appliqué ({limbo})")
+    else:
+        motif = "refusé" if d.get("decision") == "refuser" else "non appliqué (numéros incohérents)"
+        os.rename(f"{ETAT}/{proto}.json", f"{ETAT}/{proto}.refuse")
+        discord(f"**Réveilleur** : protocole {proto} {motif} par {par}.")
+        log(f"protocole {proto} {motif}")
+    os.remove(fichier)
+    if os.path.exists(f"{PCSI}/reveilleur-proposition.json"):
+        os.remove(f"{PCSI}/reveilleur-proposition.json")
+
+
+if __name__ == "__main__":
+    if not os.path.exists(PROTOCOLES):
+        open(PROTOCOLES, "w").write("# Numéros de paquets ajoutés par reveilleur-maj après validation en jeu.\n")
+    appliquer()
+    detecter()
+    sys.exit(0)

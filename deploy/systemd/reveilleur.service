@@ -4,6 +4,8 @@ After=network.target picolimbo.service
 Wants=picolimbo.service
 
 [Service]
+RuntimeDirectory=reveilleur
+RuntimeDirectoryMode=0755
 ExecStart=/usr/local/bin/reveilleur /etc/reveilleur/reveilleur.toml
 Restart=always
 RestartSec=5

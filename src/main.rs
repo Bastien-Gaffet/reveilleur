@@ -34,12 +34,17 @@ struct Config {
     amp_password_file: String,
     /// Numéros des paquets clientbound play utilisés, par version de protocole.
     /// Obtenus via le générateur de rapports du serveur (packets.json).
+    #[serde(default)]
     protocols: HashMap<String, ProtocolIds>,
+    /// Fichier complémentaire de numéros de paquets, relu à chaud sur SIGHUP
+    /// (alimenté par l'outil de mise à jour assistée, après validation en jeu).
+    #[serde(default)]
+    protocols_file: Option<String>,
     servers: Vec<ServerCfg>,
     listeners: Vec<ListenerCfg>,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy, Debug)]
 struct ProtocolIds {
     transfer: i32,
     system_chat: i32,
@@ -143,7 +148,25 @@ impl Server {
 
 struct Global {
     limbo: String,
+    protocols: std::sync::RwLock<HashMap<String, ProtocolIds>>,
+}
+
+#[derive(Deserialize)]
+struct ProtocolsFile {
+    #[serde(default)]
     protocols: HashMap<String, ProtocolIds>,
+}
+
+/// Table complète : celle de la config principale + celle du fichier complémentaire.
+fn load_protocols(inline: &HashMap<String, ProtocolIds>, file: &Option<String>) -> HashMap<String, ProtocolIds> {
+    let mut all = inline.clone();
+    if let Some(path) = file {
+        match std::fs::read_to_string(path).map_err(anyhow::Error::from).and_then(|t| Ok(toml::from_str::<ProtocolsFile>(&t)?)) {
+            Ok(f) => all.extend(f.protocols),
+            Err(e) => log(format!("{path} illisible : {e:#}")),
+        }
+    }
+    all
 }
 
 fn log(msg: impl AsRef<str>) {
@@ -619,7 +642,7 @@ async fn handle(mut client: TcpStream, lst: Arc<(ListenerCfg, Vec<Arc<Server>>)>
 
     srv.request_wake();
     let est = srv.estimate.load(Ordering::SeqCst);
-    let ids = g.protocols.get(&hs.protocol.to_string()).copied();
+    let ids = g.protocols.read().unwrap().get(&hs.protocol.to_string()).copied();
     match ids {
         Some(ids) if !lcfg.bedrock => {
             log(format!("[{}] {who} -> limbo (serveur endormi, réveil demandé)", srv.cfg.name));
@@ -885,11 +908,30 @@ fn main() -> Result<()> {
         }
         listeners.push(Arc::new((l, servers)));
     }
-    let g = Arc::new(Global { limbo: cfg.limbo, protocols: cfg.protocols });
+    let protocols = load_protocols(&cfg.protocols, &cfg.protocols_file);
+    let mut known: Vec<&String> = protocols.keys().collect();
+    known.sort();
+    log(format!("protocoles connus : {}", known.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    let g = Arc::new(Global { limbo: cfg.limbo, protocols: std::sync::RwLock::new(protocols) });
+    let (inline, pfile) = (cfg.protocols, cfg.protocols_file);
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async move {
         let mut tasks = Vec::new();
+        // SIGHUP : relit les numéros de paquets sans couper personne.
+        {
+            let g = g.clone();
+            tasks.push(tokio::spawn(async move {
+                let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
+                while hup.recv().await.is_some() {
+                    let fresh = load_protocols(&inline, &pfile);
+                    let mut known: Vec<String> = fresh.keys().cloned().collect();
+                    known.sort();
+                    *g.protocols.write().unwrap() = fresh;
+                    log(format!("protocoles rechargés : {}", known.join(", ")));
+                }
+            }));
+        }
         for lst in listeners {
             let listener = TcpListener::bind(&lst.0.addr).await.with_context(|| lst.0.addr.clone())?;
             let names: Vec<&str> = lst.1.iter().map(|s| s.cfg.name.as_str()).collect();
