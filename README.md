@@ -1,6 +1,9 @@
 # reveilleur
 
 Mise en veille des serveurs Minecraft, avec une salle d'attente façon 2b2t.
+**Un seul processus et un seul limbo pour tous les serveurs** (aujourd'hui PCSI
+en 26.2 et Les coccinelles en 26.3), aiguillés selon le port d'entrée puis
+l'adresse demandée.
 
 - **Serveur allumé** : le réveilleur relaie la connexion telle quelle.
 - **Serveur endormi** : le joueur arrive dans un **limbo** (le vide de l'End, en
@@ -15,21 +18,38 @@ environ 5 Mo), 0 % de CPU au repos, contre environ 250 Mo pour un proxy Velocity
 ## Architecture
 
 ```
-                      survie.example.com:25566
-                                     |
-                              +------v------+
-                              |  reveilleur |  (Rust, environ 3 Mo)
-                              +--+-------+--+
-          serveur prêt :         |       |        serveur endormi :
-          relais brut            |       |        limbo + réveil
-                     +-----------v+     +v-------------------+
-                     | Paper       |     | PicoLimbo          |
-                     | 127.0.0.1:  |     | 127.0.0.1:30066    |
-                     | 25567       |     | (environ 5 Mo)     |
-                     +------^------+     +--------------------+
-                            |
-                     API AMP (via ADS) : démarrage / arrêt / état
+ joueurs Java :25565 ─┐                         ┌─> PCSI (Paper 26.2)        127.0.0.1:25568  [PROXY v2]
+ joueurs Java :25566 ─┤                         │
+ port 443 (nginx) ────┼─> reveilleur (Rust) ────┼─> Les coccinelles (26.3)   127.0.0.1:25567
+   [PROXY v1]         │   environ 3 Mo          │
+ Geyser (Bedrock) ────┘                         └─> PicoLimbo (partagé)      127.0.0.1:30066
+   [PROXY v2]                  │
+                               └─ API AMP via ADS : état, démarrage, arrêt (un thread par serveur)
 ```
+
+### Écouteurs (`[[listeners]]`)
+
+| Adresse | Serveurs | Particularité |
+|---|---|---|
+| `0.0.0.0:25565` | pcsi, coccinelles | port public de PCSI |
+| `0.0.0.0:25566` | coccinelles | port public de Les coccinelles |
+| `127.0.0.1:25570` | pcsi, coccinelles | trafic Minecraft du multiplexeur nginx du port 443, précédé d'un en-tête PROXY |
+| `127.0.0.1:25569` | pcsi | Geyser (Bedrock), en-tête PROXY, `bedrock = true` |
+
+Sur un écouteur, le premier serveur est celui par défaut ; les autres sont
+choisis si l'adresse demandée figure dans leurs `hostnames`
+(ex. `survie.example.com` par le port 443).
+
+### Vraies adresses IP (PROXY protocol)
+
+- **Entrée** : nginx (`proxy_protocol on`) et Geyser (`advanced.java.use-haproxy-protocol: true`)
+  envoient l'IP réelle du joueur ; le réveilleur lit les en-têtes v1 et v2.
+- **Sortie** : pour PCSI (`proxy_protocol_out = true`, Paper
+  `proxies.proxy-protocol: true`), le réveilleur envoie un en-tête v2 : Paper,
+  les bans, CoreProtect et Plan voient la vraie IP au lieu de `127.0.0.1`.
+- Côté nginx, le trafic HTTPS passe par une étape interne
+  (`listen 127.0.0.1:8444 proxy_protocol`) qui retire l'en-tête avant les vhosts :
+  **les sites HTTPS n'ont pas été modifiés**.
 
 ### Déroulé d'une connexion
 
@@ -37,8 +57,8 @@ environ 5 Mo), 0 % de CPU au repos, contre environ 250 Mo pour un proxy Velocity
    protocole, adresse demandée, intention (liste des serveurs, connexion ou
    transfert).
 2. **Ping de la liste des serveurs** : relayé au vrai serveur s'il est prêt,
-   sinon à PicoLimbo, qui affiche « en veille, connecte-toi pour le réveiller »
-   avec l'icône du serveur.
+   sinon le réveilleur répond lui-même avec la description `sleeping_motd` et
+   l'icône du serveur concerné (aucun démarrage).
 3. **Connexion, serveur prêt** : relais brut dans les deux sens
    (`copy_bidirectional`), sans décodage. Le compteur de joueurs augmente.
 4. **Connexion, serveur endormi** :
@@ -52,7 +72,14 @@ environ 5 Mo), 0 % de CPU au repos, contre environ 250 Mo pour un proxy Velocity
      **`transfer`** (natif depuis Minecraft 1.20.5) vers la même adresse. Le
      client se reconnecte tout seul et tombe cette fois sur le vrai serveur.
 
-### Supervision (thread séparé)
+### Joueurs Bedrock et versions inconnues
+
+Un client Bedrock (via Geyser) ou un client dont la version n'est pas dans
+`[protocols]` (par exemple via ViaVersion) ne peut pas être transféré : le
+réveilleur déclenche le réveil et le déconnecte avec « Le serveur X démarre
+(environ N s). Reconnecte-toi dans un instant ! ».
+
+### Supervision (un thread par serveur)
 
 - Interroge l'état AMP toutes les 10 s au repos, toutes les secondes pendant un
   réveil.
@@ -64,26 +91,34 @@ environ 5 Mo), 0 % de CPU au repos, contre environ 250 Mo pour un proxy Velocity
 
 ## Configuration
 
-`deploy/coccinelles.toml.example` :
+`deploy/reveilleur.toml.example` (sur le VPS : `/etc/reveilleur/reveilleur.toml`).
+
+Global : `limbo`, `ads_url`, `amp_user`, `amp_password_file`, et
+`[protocols."<n°>"]` (numéros des paquets `transfer` et `system_chat`).
+
+Par serveur (`[[servers]]`) :
 
 | Clé | Rôle |
 |---|---|
-| `listen` | adresse publique (ex. `0.0.0.0:25566`) |
-| `backend` | vrai serveur, en local uniquement (ex. `127.0.0.1:25567`) |
-| `limbo` | PicoLimbo (ex. `127.0.0.1:30066`) |
-| `ads_url`, `instance_id`, `instance_name` | instance AMP pilotée |
-| `amp_user`, `amp_password_file` | compte AMP dédié (voir Sécurité) |
+| `name`, `display_name` | identifiant et nom affiché aux joueurs |
+| `hostnames` | adresses qui désignent ce serveur |
+| `backend` | vrai serveur, en local uniquement |
+| `proxy_protocol_out` | envoie la vraie IP à Paper |
+| `instance_id`, `instance_name` | instance AMP pilotée |
 | `idle_stop_minutes` | arrêt après N minutes sans joueur (0 = jamais) |
 | `ready_grace_seconds` | délai après l'état « prêt » avant le transfert |
 | `startup_history_file` | historique des durées de démarrage |
-| `[protocols."<n°>"]` | numéros des paquets `transfer` et `system_chat` pour chaque version de protocole |
+| `sleeping_motd`, `icon` | affichage dans la liste des serveurs pendant la veille |
+
+Par écouteur (`[[listeners]]`) : `addr`, `servers`, `proxy_protocol_in`, `bedrock`.
 
 Côté serveur Paper (réglages AMP, car AMP réécrit `server.properties`) :
 `AcceptsTransfers=True`, `ServerIPBinding=127.0.0.1`, port interne changé via
-`ADSModule/ApplyInstanceConfiguration` (la modification directe est refusée).
+`ADSModule/ApplyInstanceConfiguration` (la modification directe est refusée et
+l'opération arrête le conteneur de l'instance).
 
-`deploy/picolimbo/server.toml` : config du limbo (End, spectateur, liste des
-joueurs masquée, compression désactivée, message d'accueil).
+`deploy/picolimbo/server.toml` : limbo partagé (End, spectateur, liste des
+joueurs masquée, compression désactivée, message d'accueil générique).
 
 ## Sécurité
 
@@ -102,7 +137,7 @@ joueurs masquée, compression désactivée, message d'accueil).
 
 | Processus | RAM | CPU au repos |
 |---|---|---|
-| `reveilleur` | environ 3 Mo (plafond systemd 32 Mo) | 0 % |
+| `reveilleur` (tous serveurs confondus) | environ 3 Mo (plafond systemd 32 Mo) | 0 % |
 | `pico_limbo` | environ 5 à 9 Mo (plafond 64 Mo) | 0 % |
 
 ## Optimisations
@@ -135,6 +170,11 @@ joueurs masquée, compression désactivée, message d'accueil).
 2. Ajouter une section `[protocols."<nouveau protocole>"]` dans la config.
 3. Mettre à jour PicoLimbo (il suit les nouvelles versions).
 
+Versions actuelles : 26.2 (protocole 776 : transfer 129, system_chat 121) et
+26.3 (protocole 777 : transfer 132, system_chat 124). Les identifiants
+`login_finished` (2) et `finish_configuration` (3), utilisés pour savoir quand
+le joueur est en jeu, sont stables depuis la 1.20.2.
+
 ## Compilation et déploiement
 
 ```bash
@@ -142,14 +182,11 @@ cargo build --release
 install -m 755 target/release/reveilleur /usr/local/bin/reveilleur
 cp deploy/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now picolimbo-coccinelles reveilleur-coccinelles
+systemctl enable --now picolimbo reveilleur
 ```
 
 ## Feuille de route
 
-- **Un seul réveilleur et un seul limbo pour plusieurs serveurs**, aiguillés
-  selon l'adresse et le port d'entrée (Les coccinelles et PCSI), sans RAM
-  supplémentaire.
 - **Mise à jour assistée des numéros de paquets** : détection d'une nouvelle
   version, extraction automatique depuis le jar, puis validation par un
   opérateur via une commande en jeu.

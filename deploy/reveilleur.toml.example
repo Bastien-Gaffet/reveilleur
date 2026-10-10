@@ -1,0 +1,60 @@
+# Réveilleur : veille + limbo partagé + transfert, pour tous les serveurs.
+limbo = "127.0.0.1:30066"
+ads_url = "http://127.0.0.1:8080/API/"
+amp_user = "reveilleur"
+amp_password_file = "/etc/reveilleur/amp-password"
+
+# Paquets clientbound play par protocole (packets.json du serveur).
+[protocols."777"]   # 26.3
+transfer = 132
+system_chat = 124
+
+[protocols."776"]   # 26.2
+transfer = 129
+system_chat = 121
+
+[[servers]]
+name = "coccinelles"
+display_name = "Les coccinelles"
+hostnames = ["survie.example.com"]
+backend = "127.0.0.1:25567"
+instance_id = "698be81e-1a1e-4648-bd84-0abe54eae2d8"
+instance_name = "Coccinelles01"
+idle_stop_minutes = 30
+startup_history_file = "/var/lib/reveilleur/coccinelles-startups.txt"
+icon = "/home/amp/.ampdata/instances/Coccinelles01/Minecraft/server-icon.png"
+sleeping_motd = { text = "", extra = [ { text = "🐞 Les coccinelles", color = "gold" }, { text = " — en veille, connecte-toi pour le réveiller", color = "gray" } ] }
+
+[[listeners]]
+addr = "0.0.0.0:25566"
+servers = ["coccinelles"]
+
+[[servers]]
+name = "pcsi"
+display_name = "PCSI"
+backend = "127.0.0.1:25568"
+proxy_protocol_out = true
+instance_id = "1b4698f7-82a5-4f3a-a624-22cf07ca97f3"
+instance_name = "PCSI201"
+idle_stop_minutes = 30
+startup_history_file = "/var/lib/reveilleur/pcsi-startups.txt"
+icon = "/home/amp/.ampdata/instances/PCSI201/Minecraft/server-icon.png"
+sleeping_motd = { text = "", extra = [ { text = "Le serveur de la meilleure PCSI de France", color = "gold" }, { text = "\nEn veille — connecte-toi pour le réveiller (~1 min)", color = "gray" } ] }
+
+# Port public de PCSI (Java). Les coccinelles reste joignable par son adresse.
+[[listeners]]
+addr = "0.0.0.0:25565"
+servers = ["pcsi", "coccinelles"]
+
+# Multiplexeur nginx du port 443 (Minecraft caché derrière le HTTPS), avec en-tête PROXY.
+[[listeners]]
+addr = "127.0.0.1:25570"
+servers = ["pcsi", "coccinelles"]
+proxy_protocol_in = true
+
+# Geyser (Bedrock) : en-tête PROXY, pas de limbo possible.
+[[listeners]]
+addr = "127.0.0.1:25569"
+servers = ["pcsi"]
+proxy_protocol_in = true
+bedrock = true

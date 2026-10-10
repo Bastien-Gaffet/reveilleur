@@ -1,6 +1,6 @@
 bind = "127.0.0.1:30066"
-welcome_message = "<gold>Le serveur Les coccinelles se réveille…</gold> <gray>Tu seras transféré automatiquement dans une minute environ.</gray>"
-action_bar = "<yellow>Démarrage du serveur en cours…</yellow>"
+welcome_message = "<gold>Le serveur se réveille…</gold> <gray>Tu seras transféré automatiquement dès qu'il sera prêt.</gray>"
+action_bar = ""
 default_game_mode = "spectator"
 hardcore = false
 fetch_player_skins = false

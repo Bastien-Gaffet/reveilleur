@@ -1,14 +1,19 @@
-//! Réveilleur : proxy Minecraft minimaliste devant un serveur géré par AMP.
+//! Réveilleur : proxy Minecraft minimaliste devant un ou plusieurs serveurs gérés par AMP.
 //!
-//! - Serveur prêt      : la connexion est relayée telle quelle (aucun décodage).
-//! - Serveur endormi   : le joueur est envoyé dans un limbo (PicoLimbo), le serveur
-//!                       est démarré via l'API AMP, puis le joueur reçoit un paquet
-//!                       « Transfer » qui le reconnecte tout seul au vrai serveur.
-//! - Plus personne     : après `idle_stop_minutes`, le serveur est arrêté via AMP.
+//! - Serveur prêt    : la connexion est relayée telle quelle (aucun décodage).
+//! - Serveur endormi : le joueur Java patiente dans un limbo partagé (PicoLimbo), le
+//!                     serveur est démarré via l'API AMP, puis le joueur reçoit un
+//!                     paquet « Transfer » qui le reconnecte tout seul. Un joueur
+//!                     Bedrock (via Geyser) reçoit un message « reconnecte-toi ».
+//! - Plus personne   : après `idle_stop_minutes`, le serveur est arrêté via AMP.
+//!
+//! Un seul processus et un seul limbo pour tous les serveurs : l'aiguillage se fait
+//! selon le port d'entrée puis l'adresse demandée par le client.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,36 +21,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
+// ---------------------------------------------------------------- configuration
+
 #[derive(Deserialize)]
 struct Config {
-    /// Adresse publique écoutée (ex. "0.0.0.0:25566").
-    listen: String,
-    /// Vrai serveur Minecraft (ex. "127.0.0.1:25567").
-    backend: String,
-    /// Serveur limbo (PicoLimbo, ex. "127.0.0.1:30066").
+    /// Serveur limbo partagé (PicoLimbo, ex. "127.0.0.1:30066").
     limbo: String,
     /// API ADS (ex. "http://127.0.0.1:8080/API/").
     ads_url: String,
-    /// Identifiant (GUID) et nom de l'instance AMP.
-    instance_id: String,
-    instance_name: String,
     amp_user: String,
     /// Fichier contenant le mot de passe du compte AMP (lisible par root seulement).
     amp_password_file: String,
-    /// Arrêt après N minutes sans joueur (0 = jamais).
-    #[serde(default)]
-    idle_stop_minutes: u64,
-    /// Délai après l'état « Ready » d'AMP avant de transférer les joueurs.
-    #[serde(default = "default_grace")]
-    ready_grace_seconds: u64,
-    /// Décompte annoncé dans le chat avant le transfert (« Connexion dans 3… »).
-    #[serde(default = "default_countdown")]
-    countdown_seconds: u64,
-    /// Fichier où sont mémorisées les dernières durées de démarrage (secondes).
-    startup_history_file: String,
     /// Numéros des paquets clientbound play utilisés, par version de protocole.
     /// Obtenus via le générateur de rapports du serveur (packets.json).
     protocols: HashMap<String, ProtocolIds>,
+    servers: Vec<ServerCfg>,
+    listeners: Vec<ListenerCfg>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -54,12 +45,54 @@ struct ProtocolIds {
     system_chat: i32,
 }
 
-fn default_grace() -> u64 {
-    1
+#[derive(Deserialize)]
+struct ListenerCfg {
+    /// Adresse écoutée (ex. "0.0.0.0:25565").
+    addr: String,
+    /// Serveurs joignables par ce port ; le premier est celui par défaut,
+    /// les autres sont choisis selon l'adresse demandée (`hostnames`).
+    servers: Vec<String>,
+    /// Les connexions arrivent précédées d'un en-tête PROXY (nginx, Geyser).
+    #[serde(default)]
+    proxy_protocol_in: bool,
+    /// Connexions Bedrock via Geyser : pas de limbo ni de transfert possible.
+    #[serde(default)]
+    bedrock: bool,
 }
 
-fn default_countdown() -> u64 {
-    3
+#[derive(Deserialize)]
+struct ServerCfg {
+    /// Identifiant interne (ex. "pcsi").
+    name: String,
+    /// Nom affiché aux joueurs (ex. "PCSI").
+    display_name: String,
+    /// Adresses qui désignent ce serveur (comparées sans casse).
+    #[serde(default)]
+    hostnames: Vec<String>,
+    /// Vrai serveur, en local uniquement (ex. "127.0.0.1:25568").
+    backend: String,
+    /// Envoie un en-tête PROXY v2 au serveur (Paper : proxies.proxy-protocol: true).
+    #[serde(default)]
+    proxy_protocol_out: bool,
+    instance_id: String,
+    instance_name: String,
+    /// Arrêt après N minutes sans joueur (0 = jamais).
+    #[serde(default)]
+    idle_stop_minutes: u64,
+    /// Délai après l'état « Ready » d'AMP avant de transférer les joueurs.
+    #[serde(default = "default_grace")]
+    ready_grace_seconds: u64,
+    /// Fichier où sont mémorisées les dernières durées de démarrage (secondes).
+    startup_history_file: String,
+    /// Description affichée dans la liste des serveurs pendant la veille (texte JSON).
+    sleeping_motd: serde_json::Value,
+    /// Icône 64x64 affichée pendant la veille.
+    #[serde(default)]
+    icon: Option<String>,
+}
+
+fn default_grace() -> u64 {
+    1
 }
 
 /// Paliers (secondes restantes estimées) annoncés dans le chat pendant l'attente.
@@ -68,8 +101,10 @@ const MILESTONES: [u64; 7] = [30, 20, 10, 5, 3, 2, 1];
 /// Nombre de démarrages pris en compte dans la moyenne.
 const HISTORY_LEN: usize = 10;
 
-struct Shared {
-    cfg: Config,
+// ---------------------------------------------------------------- état par serveur
+
+struct Server {
+    cfg: ServerCfg,
     ready: watch::Receiver<bool>,
     wake: AtomicBool,
     /// Moment où le réveil a été demandé (pour le décompte et les statistiques).
@@ -80,12 +115,32 @@ struct Shared {
     nudge: Mutex<std::sync::mpsc::Sender<()>>,
     players: AtomicUsize,
     last_activity: Mutex<Instant>,
+    /// Icône encodée pour la réponse de statut (« data:image/png;base64,... »).
+    favicon: Option<String>,
 }
 
-impl Shared {
+impl Server {
     fn touch(&self) {
         *self.last_activity.lock().unwrap() = Instant::now();
     }
+
+    fn request_wake(&self) {
+        if !self.wake.swap(true, Ordering::SeqCst) {
+            *self.wake_since.lock().unwrap() = Some(Instant::now());
+        }
+        self.nudge.lock().unwrap().send(()).ok();
+        self.touch();
+    }
+}
+
+struct Global {
+    limbo: String,
+    protocols: HashMap<String, ProtocolIds>,
+}
+
+fn log(msg: impl AsRef<str>) {
+    // journald horodate déjà ; on garde des lignes courtes.
+    eprintln!("{}", msg.as_ref());
 }
 
 fn load_history(path: &str) -> Vec<u64> {
@@ -104,9 +159,17 @@ fn average(h: &[u64]) -> usize {
     }
 }
 
-fn log(msg: impl AsRef<str>) {
-    // journald horodate déjà ; on garde des lignes courtes.
-    eprintln!("{}", msg.as_ref());
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 // ---------------------------------------------------------------- protocole
@@ -147,6 +210,28 @@ fn frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Lit une trame complète (longueur VarInt + contenu), sans rien consommer au-delà.
+async fn read_frame(s: &mut TcpStream, max: usize) -> Result<Vec<u8>> {
+    let mut len_bytes = Vec::new();
+    loop {
+        let b = s.read_u8().await?;
+        len_bytes.push(b);
+        if b & 0x80 == 0 {
+            break;
+        }
+        if len_bytes.len() >= 3 {
+            bail!("trame trop longue");
+        }
+    }
+    let (len, _) = read_varint(&len_bytes).ok_or_else(|| anyhow!("varint"))?;
+    if len < 1 || len as usize > max {
+        bail!("taille de trame invalide");
+    }
+    let mut body = vec![0u8; len as usize];
+    s.read_exact(&mut body).await?;
+    Ok(body)
+}
+
 struct Handshake {
     raw: Vec<u8>,
     protocol: i32,
@@ -169,28 +254,12 @@ impl Handshake {
 }
 
 async fn read_handshake(s: &mut TcpStream) -> Result<Option<Handshake>> {
-    // Longueur (VarInt) octet par octet, pour ne rien consommer au-delà.
-    let mut len_bytes = Vec::new();
-    loop {
-        let b = s.read_u8().await?;
-        if len_bytes.is_empty() && b == 0xFE {
-            return Ok(None); // ancien ping (< 1.7)
-        }
-        len_bytes.push(b);
-        if b & 0x80 == 0 {
-            break;
-        }
-        if len_bytes.len() >= 3 {
-            bail!("handshake trop long");
-        }
+    let mut first = [0u8; 1];
+    s.peek(&mut first).await?;
+    if first[0] == 0xFE {
+        return Ok(None); // ancien ping (< 1.7)
     }
-    let (len, _) = read_varint(&len_bytes).ok_or_else(|| anyhow!("varint"))?;
-    if !(1..=1024).contains(&len) {
-        bail!("taille de handshake invalide");
-    }
-    let mut body = vec![0u8; len as usize];
-    s.read_exact(&mut body).await?;
-
+    let body = read_frame(s, 1024).await?;
     let mut i = 0;
     let (id, n) = read_varint(&body[i..]).ok_or_else(|| anyhow!("id"))?;
     i += n;
@@ -201,16 +270,20 @@ async fn read_handshake(s: &mut TcpStream) -> Result<Option<Handshake>> {
     i += n;
     let (slen, n) = read_varint(&body[i..]).ok_or_else(|| anyhow!("hôte"))?;
     i += n;
-    let host = String::from_utf8_lossy(body.get(i..i + slen as usize).ok_or_else(|| anyhow!("hôte"))?)
-        .to_string();
+    let host = String::from_utf8_lossy(body.get(i..i + slen as usize).ok_or_else(|| anyhow!("hôte"))?).to_string();
     i += slen as usize;
-    let port = u16::from_be_bytes([*body.get(i).ok_or_else(|| anyhow!("port"))?, *body.get(i + 1).ok_or_else(|| anyhow!("port"))?]);
+    let port = u16::from_be_bytes([
+        *body.get(i).ok_or_else(|| anyhow!("port"))?,
+        *body.get(i + 1).ok_or_else(|| anyhow!("port"))?,
+    ]);
     i += 2;
     let (intent, _) = read_varint(&body[i..]).ok_or_else(|| anyhow!("intention"))?;
+    Ok(Some(Handshake { raw: frame(&body), protocol, host, port, intent }))
+}
 
-    let mut raw = len_bytes;
-    raw.extend_from_slice(&body);
-    Ok(Some(Handshake { raw, protocol, host, port, intent }))
+/// Nom d'hôte « propre » (sans marqueurs Forge/Floodgate, sans point final, en minuscules).
+fn clean_host(h: &str) -> String {
+    h.split('\0').next().unwrap_or("").trim_end_matches('.').to_lowercase()
 }
 
 /// Chaîne NBT (UTF-8 modifié de Java) : on écarte les caractères hors BMP (emojis)
@@ -236,19 +309,141 @@ fn chat_packet(id: i32, text: &str, color: &str, action_bar: bool) -> Vec<u8> {
     frame(&p)
 }
 
-/// Nom d'hôte « propre » pour le paquet Transfer (sans marqueurs Forge, sans point final).
-fn clean_host(h: &str) -> String {
-    h.split('\0').next().unwrap_or("").trim_end_matches('.').to_string()
+/// Paquet « login_disconnect » (état login, id 0, raison en texte JSON).
+fn login_disconnect(text: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, 0);
+    write_string(&mut p, &serde_json::json!({"text": text, "color": "gold"}).to_string());
+    frame(&p)
+}
+
+// ---------------------------------------------------------------- PROXY protocol
+
+const PROXY_V2_SIG: [u8; 12] = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+
+/// Lit un en-tête PROXY v1 ou v2 et renvoie l'adresse réelle du client (si fournie).
+async fn read_proxy_header(s: &mut TcpStream) -> Result<Option<SocketAddr>> {
+    let mut head = [0u8; 16];
+    s.read_exact(&mut head).await?;
+    if head[..12] == PROXY_V2_SIG {
+        let len = u16::from_be_bytes([head[14], head[15]]) as usize;
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).await?;
+        let cmd = head[12] & 0x0F; // 0 = LOCAL, 1 = PROXY
+        return Ok(match (cmd, head[13] >> 4) {
+            (1, 1) if len >= 12 => Some(SocketAddr::new(
+                IpAddr::from([body[0], body[1], body[2], body[3]]),
+                u16::from_be_bytes([body[8], body[9]]),
+            )),
+            (1, 2) if len >= 36 => {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&body[..16]);
+                Some(SocketAddr::new(IpAddr::from(a), u16::from_be_bytes([body[32], body[33]])))
+            }
+            _ => None,
+        });
+    }
+    if &head[..6] == b"PROXY " {
+        // v1 : texte terminé par \r\n (107 octets maximum).
+        let mut line = head.to_vec();
+        while !line.ends_with(b"\r\n") {
+            if line.len() > 107 {
+                bail!("en-tête PROXY v1 trop long");
+            }
+            line.push(s.read_u8().await?);
+        }
+        let txt = String::from_utf8_lossy(&line);
+        let parts: Vec<&str> = txt.trim_end().split(' ').collect();
+        if parts.len() == 6 {
+            if let (Ok(ip), Ok(port)) = (parts[2].parse::<IpAddr>(), parts[4].parse::<u16>()) {
+                return Ok(Some(SocketAddr::new(ip, port)));
+            }
+        }
+        return Ok(None);
+    }
+    bail!("en-tête PROXY attendu")
+}
+
+/// En-tête PROXY v2 annonçant `src` comme adresse du client.
+fn proxy_v2_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let mut h = PROXY_V2_SIG.to_vec();
+    h.push(0x21); // version 2, commande PROXY
+    let (src_ip, dst_ip) = (canonical(src.ip()), canonical(dst.ip()));
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            h.push(0x11); // TCP sur IPv4
+            h.extend_from_slice(&12u16.to_be_bytes());
+            h.extend_from_slice(&s.octets());
+            h.extend_from_slice(&d.octets());
+        }
+        (s, d) => {
+            let v6 = |ip: IpAddr| match ip {
+                IpAddr::V4(a) => a.to_ipv6_mapped(),
+                IpAddr::V6(a) => a,
+            };
+            h.push(0x21); // TCP sur IPv6
+            h.extend_from_slice(&36u16.to_be_bytes());
+            h.extend_from_slice(&v6(s).octets());
+            h.extend_from_slice(&v6(d).octets());
+        }
+    }
+    h.extend_from_slice(&src.port().to_be_bytes());
+    h.extend_from_slice(&dst.port().to_be_bytes());
+    h
+}
+
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
 }
 
 // ---------------------------------------------------------------- relais
 
-async fn pipe(client: TcpStream, target: &str, first: &[u8]) -> Result<()> {
-    let mut up = TcpStream::connect(target).await.with_context(|| format!("connexion à {target}"))?;
+/// Ouvre la connexion vers le vrai serveur (avec en-tête PROXY si demandé).
+async fn connect_backend(srv: &Server, client_addr: SocketAddr) -> Result<TcpStream> {
+    let mut up = TcpStream::connect(&srv.cfg.backend)
+        .await
+        .with_context(|| format!("connexion à {}", srv.cfg.backend))?;
     up.set_nodelay(true).ok();
+    if srv.cfg.proxy_protocol_out {
+        let dst = up.peer_addr()?;
+        up.write_all(&proxy_v2_header(client_addr, dst)).await?;
+    }
+    Ok(up)
+}
+
+async fn pipe(mut client: TcpStream, mut up: TcpStream, first: &[u8]) -> Result<()> {
     up.write_all(first).await?;
-    let mut client = client;
     tokio::io::copy_bidirectional(&mut client, &mut up).await.ok();
+    Ok(())
+}
+
+/// Réponse à la liste des serveurs pendant la veille (statut + ping), sans démarrer le serveur.
+async fn sleeping_status(mut client: TcpStream, srv: &Server, hs: &Handshake) -> Result<()> {
+    let req = read_frame(&mut client, 16).await?;
+    if req.first() != Some(&0) {
+        return Ok(());
+    }
+    let mut status = serde_json::json!({
+        "version": {"name": "En veille", "protocol": hs.protocol},
+        "players": {"max": 20, "online": 0},
+        "description": srv.cfg.sleeping_motd,
+    });
+    if let Some(f) = &srv.favicon {
+        status["favicon"] = serde_json::Value::String(f.clone());
+    }
+    let mut p = Vec::new();
+    write_varint(&mut p, 0);
+    write_string(&mut p, &status.to_string());
+    client.write_all(&frame(&p)).await?;
+    // Ping (id 1 + entier de 8 octets) : on renvoie le même contenu.
+    if let Ok(Ok(ping)) = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client, 16)).await {
+        if ping.first() == Some(&1) {
+            client.write_all(&frame(&ping)).await?;
+        }
+    }
     Ok(())
 }
 
@@ -260,12 +455,11 @@ enum Phase {
 }
 
 /// Fait patienter le joueur dans le limbo, puis lui envoie un paquet Transfer.
-async fn limbo_hold(client: TcpStream, hs: Handshake, sh: Arc<Shared>) -> Result<()> {
-    let mut up = TcpStream::connect(&sh.cfg.limbo).await.context("connexion au limbo")?;
+async fn limbo_hold(client: TcpStream, hs: Handshake, srv: Arc<Server>, g: &Global, ids: ProtocolIds) -> Result<()> {
+    let mut up = TcpStream::connect(&g.limbo).await.context("connexion au limbo")?;
     up.set_nodelay(true).ok();
     up.write_all(&hs.with_intent(2)).await?;
 
-    let ids = sh.cfg.protocols.get(&hs.protocol.to_string()).copied();
     let (mut cr, mut cw) = client.into_split();
     let (mut lr, mut lw) = up.into_split();
     let c2l = tokio::spawn(async move {
@@ -273,7 +467,8 @@ async fn limbo_hold(client: TcpStream, hs: Handshake, sh: Arc<Shared>) -> Result
     });
 
     let arrived = Instant::now();
-    let mut ready = sh.ready.clone();
+    let name = srv.cfg.display_name.clone();
+    let mut ready = srv.ready.clone();
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = vec![0u8; 8192];
     let mut phase = Phase::Login;
@@ -282,12 +477,9 @@ async fn limbo_hold(client: TcpStream, hs: Handshake, sh: Arc<Shared>) -> Result
     let mut late_notice = false;
     let result = loop {
         if phase == Phase::Play {
-            let Some(ids) = ids else {
-                break Err(anyhow!("protocole {} inconnu : pas de transfert possible", hs.protocol));
-            };
-            let est = sh.estimate.load(Ordering::SeqCst) as u64;
+            let est = srv.estimate.load(Ordering::SeqCst) as u64;
             if !announced {
-                let msg = format!("Démarrage du serveur en cours, environ {est} s. Ne te déconnecte pas !");
+                let msg = format!("Démarrage du serveur {name} en cours, environ {est} s. Ne te déconnecte pas !");
                 cw.write_all(&chat_packet(ids.system_chat, &msg, "gold", false)).await?;
                 announced = true;
             }
@@ -301,14 +493,13 @@ async fn limbo_hold(client: TcpStream, hs: Handshake, sh: Arc<Shared>) -> Result
                 write_varint(&mut p, hs.port as i32);
                 cw.write_all(&frame(&p)).await?;
                 cw.flush().await?;
-                log(format!("transfert vers {host}:{} après {} s d'attente", hs.port, arrived.elapsed().as_secs()));
+                log(format!("[{}] transfert vers {host}:{} après {} s d'attente", srv.cfg.name, hs.port, arrived.elapsed().as_secs()));
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 break Ok(());
             }
             // En attente : un message par palier franchi (30, 20, 10, 5, 3, 2, 1 s).
-            let since = sh.wake_since.lock().unwrap().unwrap_or(arrived);
-            let elapsed = since.elapsed().as_secs();
-            let remaining = est.saturating_sub(elapsed);
+            let since = srv.wake_since.lock().unwrap().unwrap_or(arrived);
+            let remaining = est.saturating_sub(since.elapsed().as_secs());
             if let Some(&m) = MILESTONES.iter().find(|&&m| remaining == m && m < next_milestone && m < est) {
                 cw.write_all(&chat_packet(ids.system_chat, &format!("Connexion dans ~{m} s"), "yellow", false)).await?;
                 next_milestone = m;
@@ -324,10 +515,13 @@ async fn limbo_hold(client: TcpStream, hs: Handshake, sh: Arc<Shared>) -> Result
                 if n == 0 { break Ok(()); }
                 buf.extend_from_slice(&chunk[..n]);
                 // On ne relaie que des trames complètes, pour pouvoir insérer
-                // le paquet Transfer entre deux trames.
+                // nos propres paquets entre deux trames.
                 loop {
                     let Some((len, ln)) = read_varint(&buf) else { break };
-                    if len < 0 || len > (1 << 21) { break_with_error()?; }
+                    if !(0..=(1 << 21)).contains(&len) {
+                        c2l.abort();
+                        bail!("trame limbo invalide");
+                    }
                     let total = ln + len as usize;
                     if buf.len() < total { break; }
                     if let Some((id, _)) = read_varint(&buf[ln..total]) {
@@ -349,45 +543,70 @@ async fn limbo_hold(client: TcpStream, hs: Handshake, sh: Arc<Shared>) -> Result
     result
 }
 
-fn break_with_error() -> Result<()> {
-    bail!("trame limbo invalide")
-}
-
-async fn handle(mut client: TcpStream, sh: Arc<Shared>) -> Result<()> {
+async fn handle(mut client: TcpStream, lst: Arc<(ListenerCfg, Vec<Arc<Server>>)>, g: Arc<Global>) -> Result<()> {
     client.set_nodelay(true).ok();
-    let peer = client.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (lcfg, servers) = (&lst.0, &lst.1);
+    let mut addr = client.peer_addr()?;
+    if lcfg.proxy_protocol_in {
+        if let Some(real) = tokio::time::timeout(Duration::from_secs(5), read_proxy_header(&mut client)).await?? {
+            addr = real;
+        }
+    }
     let hs = match tokio::time::timeout(Duration::from_secs(10), read_handshake(&mut client)).await?? {
         Some(h) => h,
         None => return Ok(()), // ancien ping : ignoré
     };
-    let ready = *sh.ready.borrow();
+    let host = clean_host(&hs.host);
+    let srv = servers
+        .iter()
+        .find(|s| s.cfg.hostnames.iter().any(|h| h.eq_ignore_ascii_case(&host)))
+        .unwrap_or(&servers[0])
+        .clone();
+    let ready = *srv.ready.borrow();
+    let who = canonical(addr.ip());
 
     if hs.intent == 1 {
-        // Liste des serveurs : le vrai serveur s'il est prêt, sinon la MOTD « en veille » du limbo.
-        let target = if ready { &sh.cfg.backend } else { &sh.cfg.limbo };
-        return pipe(client, target, &hs.raw).await;
+        if ready {
+            if let Ok(up) = connect_backend(&srv, addr).await {
+                return pipe(client, up, &hs.raw).await;
+            }
+        }
+        return sleeping_status(client, &srv, &hs).await;
     }
 
     if ready {
-        if let Ok(up) = TcpStream::connect(&sh.cfg.backend).await {
-            drop(up);
-            sh.players.fetch_add(1, Ordering::SeqCst);
-            sh.touch();
-            log(format!("{peer} -> serveur ({} en ligne)", sh.players.load(Ordering::SeqCst)));
-            let r = pipe(client, &sh.cfg.backend, &hs.raw).await;
-            sh.players.fetch_sub(1, Ordering::SeqCst);
-            sh.touch();
+        if let Ok(up) = connect_backend(&srv, addr).await {
+            srv.players.fetch_add(1, Ordering::SeqCst);
+            srv.touch();
+            log(format!("[{}] {who} -> serveur ({} en ligne)", srv.cfg.name, srv.players.load(Ordering::SeqCst)));
+            let r = pipe(client, up, &hs.raw).await;
+            srv.players.fetch_sub(1, Ordering::SeqCst);
+            srv.touch();
             return r;
         }
     }
 
-    log(format!("{peer} -> limbo (serveur endormi, réveil demandé)"));
-    if !sh.wake.swap(true, Ordering::SeqCst) {
-        *sh.wake_since.lock().unwrap() = Some(Instant::now());
+    srv.request_wake();
+    let est = srv.estimate.load(Ordering::SeqCst);
+    let ids = g.protocols.get(&hs.protocol.to_string()).copied();
+    match ids {
+        Some(ids) if !lcfg.bedrock => {
+            log(format!("[{}] {who} -> limbo (serveur endormi, réveil demandé)", srv.cfg.name));
+            limbo_hold(client, hs, srv, &g, ids).await
+        }
+        _ => {
+            // Bedrock (Geyser) ou version inconnue : pas de transfert possible.
+            log(format!("[{}] {who} -> réveil demandé, invité à se reconnecter", srv.cfg.name));
+            let msg = format!(
+                "Le serveur {} démarre (environ {est} s). Reconnecte-toi dans un instant !",
+                srv.cfg.display_name
+            );
+            client.write_all(&login_disconnect(&msg)).await?;
+            client.flush().await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(())
+        }
     }
-    sh.nudge.lock().unwrap().send(()).ok();
-    sh.touch();
-    limbo_hold(client, hs, sh).await
 }
 
 // ---------------------------------------------------------------- AMP
@@ -453,42 +672,44 @@ impl Amp {
     }
 }
 
-/// Boucle de supervision : suit l'état AMP, démarre sur demande, arrête si inactif.
-fn supervisor(sh: Arc<Shared>, ready_tx: watch::Sender<bool>, nudge: std::sync::mpsc::Receiver<()>) {
-    let password = std::fs::read_to_string(&sh.cfg.amp_password_file)
-        .expect("mot de passe AMP illisible")
-        .trim()
-        .to_string();
+/// Boucle de supervision d'un serveur : suit l'état AMP, démarre sur demande, arrête si inactif.
+fn supervisor(
+    srv: Arc<Server>,
+    ready_tx: watch::Sender<bool>,
+    nudge: std::sync::mpsc::Receiver<()>,
+    ads_url: String,
+    user: String,
+    password: String,
+) {
+    let name = srv.cfg.name.clone();
+    let log = |m: String| log(format!("[{name}] {m}"));
     // Instance (via le proxy ADS) et ADS lui-même, avec le même compte.
     let mut amp = Amp {
-        url: format!("{}ADSModule/Servers/{}/API/", sh.cfg.ads_url, sh.cfg.instance_id),
-        user: sh.cfg.amp_user.clone(),
+        url: format!("{ads_url}ADSModule/Servers/{}/API/", srv.cfg.instance_id),
+        user: user.clone(),
         password: password.clone(),
         session: None,
     };
-    let mut ads = Amp { url: sh.cfg.ads_url.clone(), user: sh.cfg.amp_user.clone(), password, session: None };
+    let mut ads = Amp { url: ads_url, user, password, session: None };
     let mut ready_since: Option<Instant> = None;
     let mut last_start_cmd: Option<Instant> = None;
     let mut last_ads_start: Option<Instant> = None;
+    let mut last_error_log: Option<Instant> = None;
     loop {
-        let waking = sh.wake.load(Ordering::SeqCst);
+        let waking = srv.wake.load(Ordering::SeqCst);
         match amp.state() {
             Ok(st) => {
                 // 20 = Ready ; 0 = Stopped ; 100 = Failed
                 if st == 20 {
                     let since = *ready_since.get_or_insert_with(Instant::now);
-                    let ok = since.elapsed() >= Duration::from_secs(sh.cfg.ready_grace_seconds);
-                    ready_tx.send_if_modified(|r| {
-                        let changed = *r != ok;
-                        *r = ok;
-                        changed
-                    });
+                    let ok = since.elapsed() >= Duration::from_secs(srv.cfg.ready_grace_seconds);
+                    ready_tx.send_if_modified(|r| std::mem::replace(r, ok) != ok);
                     if ok && waking {
-                        sh.wake.store(false, Ordering::SeqCst);
+                        srv.wake.store(false, Ordering::SeqCst);
                         // Mémorise la durée réelle du démarrage pour affiner l'estimation.
-                        if let Some(t0) = sh.wake_since.lock().unwrap().take() {
+                        if let Some(t0) = srv.wake_since.lock().unwrap().take() {
                             let secs = t0.elapsed().as_secs();
-                            let path = &sh.cfg.startup_history_file;
+                            let path = &srv.cfg.startup_history_file;
                             let mut h = load_history(path);
                             h.push(secs);
                             if h.len() > HISTORY_LEN {
@@ -496,10 +717,8 @@ fn supervisor(sh: Arc<Shared>, ready_tx: watch::Sender<bool>, nudge: std::sync::
                             }
                             let txt: Vec<String> = h.iter().map(|s| s.to_string()).collect();
                             std::fs::write(path, txt.join(" ") + "\n").ok();
-                            sh.estimate.store(average(&h), Ordering::SeqCst);
-                            log(format!("serveur prêt en {secs} s (moyenne {} s), transfert des joueurs en attente", average(&h)));
-                        } else {
-                            log("serveur prêt, transfert des joueurs en attente");
+                            srv.estimate.store(average(&h), Ordering::SeqCst);
+                            log(format!("serveur prêt en {secs} s (moyenne {} s)", average(&h)));
                         }
                     }
                 } else {
@@ -507,7 +726,7 @@ fn supervisor(sh: Arc<Shared>, ready_tx: watch::Sender<bool>, nudge: std::sync::
                     ready_tx.send_if_modified(|r| std::mem::replace(r, false));
                 }
 
-                let recently = last_start_cmd.map_or(false, |t| t.elapsed() < Duration::from_secs(60));
+                let recently = last_start_cmd.is_some_and(|t| t.elapsed() < Duration::from_secs(60));
                 if waking && (st == 0 || st == 100) && !recently {
                     log(format!("démarrage du serveur (état AMP {st})"));
                     match amp.call("Core/Start") {
@@ -516,15 +735,15 @@ fn supervisor(sh: Arc<Shared>, ready_tx: watch::Sender<bool>, nudge: std::sync::
                     }
                 }
 
-                let idle = sh.cfg.idle_stop_minutes;
-                if idle > 0 && st == 20 && !waking && sh.players.load(Ordering::SeqCst) == 0 {
-                    let quiet = sh.last_activity.lock().unwrap().elapsed();
+                let idle = srv.cfg.idle_stop_minutes;
+                if idle > 0 && st == 20 && !waking && srv.players.load(Ordering::SeqCst) == 0 {
+                    let quiet = srv.last_activity.lock().unwrap().elapsed();
                     if quiet >= Duration::from_secs(idle * 60) {
                         log(format!("aucun joueur depuis {idle} min : arrêt du serveur"));
                         if let Err(e) = amp.call("Core/Stop") {
                             log(format!("échec Core/Stop : {e:#}"));
                         }
-                        sh.touch();
+                        srv.touch();
                     }
                 }
             }
@@ -533,21 +752,22 @@ fn supervisor(sh: Arc<Shared>, ready_tx: watch::Sender<bool>, nudge: std::sync::
                 ready_tx.send_if_modified(|r| std::mem::replace(r, false));
                 amp.session = None;
                 // L'instance AMP elle-même (son conteneur) est arrêtée : on la démarre via ADS.
-                let recently = last_ads_start.map_or(false, |t| t.elapsed() < Duration::from_secs(90));
+                let recently = last_ads_start.is_some_and(|t| t.elapsed() < Duration::from_secs(90));
                 if waking && !recently {
                     log(format!("instance AMP indisponible ({e:#}) : démarrage via ADS"));
-                    let body = serde_json::json!({"InstanceName": sh.cfg.instance_name});
+                    let body = serde_json::json!({"InstanceName": srv.cfg.instance_name});
                     if let Err(e) = ads.call_with("ADSModule/StartInstance", body) {
                         log(format!("échec ADSModule/StartInstance : {e:#}"));
                     }
                     last_ads_start = Some(Instant::now());
-                } else if !waking {
+                } else if !waking && last_error_log.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
                     log(format!("API AMP indisponible : {e:#}"));
+                    last_error_log = Some(Instant::now());
                 }
             }
         }
         // Au repos on vérifie toutes les 10 s, mais une demande de réveil interrompt l'attente.
-        let pause = if sh.wake.load(Ordering::SeqCst) { 1 } else { 10 };
+        let pause = if srv.wake.load(Ordering::SeqCst) { 1 } else { 10 };
         let _ = nudge.recv_timeout(Duration::from_secs(pause));
         while nudge.try_recv().is_ok() {}
     }
@@ -556,37 +776,75 @@ fn supervisor(sh: Arc<Shared>, ready_tx: watch::Sender<bool>, nudge: std::sync::
 // ---------------------------------------------------------------- main
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/reveilleur/coccinelles.toml".into());
+    let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/reveilleur/reveilleur.toml".into());
     let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).with_context(|| path.clone())?)?;
-    let (ready_tx, ready_rx) = watch::channel(false);
-    let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
-    let estimate = average(&load_history(&cfg.startup_history_file));
-    let sh = Arc::new(Shared {
-        cfg,
-        ready: ready_rx,
-        wake: AtomicBool::new(false),
-        wake_since: Mutex::new(None),
-        estimate: AtomicUsize::new(estimate),
-        nudge: Mutex::new(nudge_tx),
-        players: AtomicUsize::new(0),
-        last_activity: Mutex::new(Instant::now()),
-    });
+    let password = std::fs::read_to_string(&cfg.amp_password_file)
+        .context("mot de passe AMP illisible")?
+        .trim()
+        .to_string();
 
-    let sup = sh.clone();
-    std::thread::spawn(move || supervisor(sup, ready_tx, nudge_rx));
+    let mut by_name: HashMap<String, Arc<Server>> = HashMap::new();
+    for s in cfg.servers {
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
+        let favicon = s
+            .icon
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| format!("data:image/png;base64,{}", base64(&b)));
+        let srv = Arc::new(Server {
+            estimate: AtomicUsize::new(average(&load_history(&s.startup_history_file))),
+            cfg: s,
+            ready: ready_rx,
+            wake: AtomicBool::new(false),
+            wake_since: Mutex::new(None),
+            nudge: Mutex::new(nudge_tx),
+            players: AtomicUsize::new(0),
+            last_activity: Mutex::new(Instant::now()),
+            favicon,
+        });
+        let (sup, ads, user, pw) = (srv.clone(), cfg.ads_url.clone(), cfg.amp_user.clone(), password.clone());
+        std::thread::spawn(move || supervisor(sup, ready_tx, nudge_rx, ads, user, pw));
+        by_name.insert(srv.cfg.name.clone(), srv);
+    }
+
+    let mut listeners = Vec::new();
+    for l in cfg.listeners {
+        let servers = l
+            .servers
+            .iter()
+            .map(|n| by_name.get(n).cloned().ok_or_else(|| anyhow!("serveur inconnu : {n}")))
+            .collect::<Result<Vec<_>>>()?;
+        if servers.is_empty() {
+            bail!("écouteur {} sans serveur", l.addr);
+        }
+        listeners.push(Arc::new((l, servers)));
+    }
+    let g = Arc::new(Global { limbo: cfg.limbo, protocols: cfg.protocols });
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async move {
-        let listener = TcpListener::bind(&sh.cfg.listen).await?;
-        log(format!("réveilleur en écoute sur {}", sh.cfg.listen));
-        loop {
-            let (sock, _) = listener.accept().await?;
-            let sh = sh.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle(sock, sh).await {
-                    log(format!("connexion : {e:#}"));
+        let mut tasks = Vec::new();
+        for lst in listeners {
+            let listener = TcpListener::bind(&lst.0.addr).await.with_context(|| lst.0.addr.clone())?;
+            let names: Vec<&str> = lst.1.iter().map(|s| s.cfg.name.as_str()).collect();
+            log(format!("écoute sur {} -> {}", lst.0.addr, names.join(", ")));
+            let g = g.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { continue };
+                    let (lst, g) = (lst.clone(), g.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = handle(sock, lst, g).await {
+                            log(format!("connexion : {e:#}"));
+                        }
+                    });
                 }
-            });
+            }));
         }
+        for t in tasks {
+            t.await.ok();
+        }
+        Ok(())
     })
 }

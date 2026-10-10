@@ -1,9 +1,9 @@
 [Unit]
-Description=PicoLimbo - salle d attente du serveur Les coccinelles
+Description=PicoLimbo - salle d attente partagée des serveurs en veille
 After=network.target
 
 [Service]
-WorkingDirectory=/opt/picolimbo/coccinelles
+WorkingDirectory=/opt/picolimbo/limbo
 ExecStart=/opt/picolimbo/pico_limbo --skip-banner -c server.toml
 Restart=always
 RestartSec=5

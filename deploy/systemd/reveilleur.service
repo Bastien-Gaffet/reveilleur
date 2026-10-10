@@ -1,0 +1,13 @@
+[Unit]
+Description=Reveilleur des serveurs Minecraft (veille + limbo + transfert)
+After=network.target picolimbo.service
+Wants=picolimbo.service
+
+[Service]
+ExecStart=/usr/local/bin/reveilleur /etc/reveilleur/reveilleur.toml
+Restart=always
+RestartSec=5
+MemoryMax=32M
+
+[Install]
+WantedBy=multi-user.target
