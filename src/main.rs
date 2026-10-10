@@ -79,6 +79,10 @@ struct ServerCfg {
     /// Arrêt après N minutes sans joueur (0 = jamais).
     #[serde(default)]
     idle_stop_minutes: u64,
+    /// Après un arrêt pour inactivité, éteint aussi le conteneur AMP de l'instance
+    /// (économise environ 300 Mo ; le réveil prend alors une dizaine de secondes de plus).
+    #[serde(default = "default_true")]
+    stop_instance_when_idle: bool,
     /// Délai après l'état « Ready » d'AMP avant de transférer les joueurs.
     #[serde(default = "default_grace")]
     ready_grace_seconds: u64,
@@ -93,6 +97,10 @@ struct ServerCfg {
 
 fn default_grace() -> u64 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Paliers (secondes restantes estimées) annoncés dans le chat pendant l'attente.
@@ -695,10 +703,26 @@ fn supervisor(
     let mut last_start_cmd: Option<Instant> = None;
     let mut last_ads_start: Option<Instant> = None;
     let mut last_error_log: Option<Instant> = None;
+    // Arrêt pour inactivité en cours : une fois Minecraft arrêté, on éteint le conteneur.
+    let mut idle_stopped = false;
     loop {
         let waking = srv.wake.load(Ordering::SeqCst);
+        if waking {
+            idle_stopped = false;
+        }
         match amp.state() {
             Ok(st) => {
+                if idle_stopped && st == 0 {
+                    idle_stopped = false;
+                    if srv.cfg.stop_instance_when_idle {
+                        log("serveur arrêté : extinction du conteneur AMP".to_string());
+                        let body = serde_json::json!({"InstanceName": srv.cfg.instance_name});
+                        if let Err(e) = ads.call_with("ADSModule/StopInstance", body) {
+                            log(format!("échec ADSModule/StopInstance : {e:#}"));
+                        }
+                        amp.session = None;
+                    }
+                }
                 // 20 = Ready ; 0 = Stopped ; 100 = Failed
                 if st == 20 {
                     let since = *ready_since.get_or_insert_with(Instant::now);
@@ -740,8 +764,9 @@ fn supervisor(
                     let quiet = srv.last_activity.lock().unwrap().elapsed();
                     if quiet >= Duration::from_secs(idle * 60) {
                         log(format!("aucun joueur depuis {idle} min : arrêt du serveur"));
-                        if let Err(e) = amp.call("Core/Stop") {
-                            log(format!("échec Core/Stop : {e:#}"));
+                        match amp.call("Core/Stop") {
+                            Ok(_) => idle_stopped = true,
+                            Err(e) => log(format!("échec Core/Stop : {e:#}")),
                         }
                         srv.touch();
                     }

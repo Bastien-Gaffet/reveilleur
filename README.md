@@ -87,7 +87,11 @@ réveilleur déclenche le réveil et le déconnecte avec « Le serveur X démarr
   (`ADSModule/StartInstance`), puis démarre le serveur (`Core/Start`).
 - Mesure chaque démarrage réel et garde les 10 derniers
   (`startup_history_file`) : l'estimation annoncée aux joueurs est leur moyenne.
-- Arrête le serveur (`Core/Stop`) après `idle_stop_minutes` sans joueur.
+- Arrête le serveur (`Core/Stop`) après `idle_stop_minutes` sans joueur, puis,
+  une fois Minecraft arrêté, **éteint aussi le conteneur AMP de l'instance**
+  (`ADSModule/StopInstance`, réglage `stop_instance_when_idle`, actif par
+  défaut) : environ 260 à 300 Mo libérés par serveur endormi. Le réveil
+  rallume le conteneur (une dizaine de secondes de plus).
 
 ## Configuration
 
@@ -106,6 +110,7 @@ Par serveur (`[[servers]]`) :
 | `proxy_protocol_out` | envoie la vraie IP à Paper |
 | `instance_id`, `instance_name` | instance AMP pilotée |
 | `idle_stop_minutes` | arrêt après N minutes sans joueur (0 = jamais) |
+| `stop_instance_when_idle` | éteint aussi le conteneur AMP après un arrêt pour inactivité (défaut : oui) |
 | `ready_grace_seconds` | délai après l'état « prêt » avant le transfert |
 | `startup_history_file` | historique des durées de démarrage |
 | `sleeping_motd`, `icon` | affichage dans la liste des serveurs pendant la veille |
@@ -124,7 +129,7 @@ joueurs masquée, compression désactivée, message d'accueil générique).
 
 - Compte AMP **dédié** `reveilleur`, mot de passe aléatoire dans un fichier
   lisible par root seulement. Rôle « Reveilleur » limité à **une** instance :
-  `Instances.<id>.Manage`, `Instances.<id>.Start`, et, **posées dans
+  `Instances.<id>.Manage`, `Instances.<id>.Start`, `Instances.<id>.Stop`, et, **posées dans
   l'instance elle-même**, `Core.AppManagement.StartApplication` et
   `StopApplication` (les poser seulement côté ADS ne suffit pas). L'accès aux
   autres instances est refusé.
