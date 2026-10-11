@@ -27,10 +27,13 @@ use tokio::sync::watch;
 struct Config {
     /// Serveur limbo partagé (PicoLimbo, ex. "127.0.0.1:30066").
     limbo: String,
-    /// API ADS (ex. "http://127.0.0.1:8080/API/").
+    /// API ADS (ex. "http://127.0.0.1:8080/API/"). Inutile si tous les serveurs sont en systemd.
+    #[serde(default)]
     ads_url: String,
+    #[serde(default)]
     amp_user: String,
     /// Fichier contenant le mot de passe du compte AMP (lisible par root seulement).
+    #[serde(default)]
     amp_password_file: String,
     /// Numéros des paquets clientbound play utilisés, par version de protocole.
     /// Obtenus via le générateur de rapports du serveur (packets.json).
@@ -79,8 +82,18 @@ struct ServerCfg {
     /// Envoie un en-tête PROXY v2 au serveur (Paper : proxies.proxy-protocol: true).
     #[serde(default)]
     proxy_protocol_out: bool,
+    /// Instance AMP (mode AMP). En mode systemd, `instance_name` sert seulement à
+    /// retrouver le journal du serveur.
+    #[serde(default)]
     instance_id: String,
     instance_name: String,
+    /// Mode sans AMP : unité systemd du serveur (ex. "minecraft@PCSI201").
+    #[serde(default)]
+    systemd_unit: Option<String>,
+    /// Journal du serveur, pour savoir quand il est prêt (« Done (… ») en mode systemd.
+    /// Par défaut : /home/amp/.ampdata/instances/<instance_name>/Minecraft/logs/latest.log
+    #[serde(default)]
+    log_file: Option<String>,
     /// Arrêt après N minutes sans joueur (0 = jamais).
     #[serde(default)]
     idle_stop_minutes: u64,
@@ -726,25 +739,109 @@ impl Amp {
     }
 }
 
+/// Pilotage d'un serveur : par l'API AMP, ou directement par systemd (sans AMP).
+/// Les états suivent la numérotation d'AMP : 0 arrêté, 10 en démarrage, 20 prêt,
+/// 40 en arrêt, 100 en échec.
+enum Backend {
+    Amp { amp: Amp, ads: Amp, instance: String },
+    Systemd { unit: String, log_file: String },
+}
+
+impl Backend {
+    fn state(&mut self) -> Result<i64> {
+        match self {
+            Backend::Amp { amp, .. } => amp.state(),
+            Backend::Systemd { unit, log_file } => {
+                let out = std::process::Command::new("systemctl")
+                    .args(["show", "-p", "ActiveState", "--value", unit.as_str()])
+                    .output()?;
+                Ok(match String::from_utf8_lossy(&out.stdout).trim() {
+                    "active" => {
+                        // Le port s'ouvre avant le chargement du monde : on attend « Done ».
+                        let pret = std::fs::read_to_string(log_file.as_str())
+                            .is_ok_and(|l| l.contains("]: Done ("));
+                        if pret { 20 } else { 10 }
+                    }
+                    "activating" | "reloading" => 10,
+                    "deactivating" => 40,
+                    "failed" => 100,
+                    _ => 0,
+                })
+            }
+        }
+    }
+
+    fn start(&mut self) -> Result<()> {
+        match self {
+            Backend::Amp { amp, .. } => amp.call("Core/Start").map(|_| ()),
+            Backend::Systemd { unit, .. } => {
+                // Efface un éventuel état « failed » (sans bruit si l'unité n'était pas chargée).
+                let _ = std::process::Command::new("systemctl")
+                    .args(["reset-failed", unit.as_str()])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                systemctl(&["start", "--no-block", unit.as_str()])
+            }
+        }
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        match self {
+            Backend::Amp { amp, .. } => amp.call("Core/Stop").map(|_| ()),
+            Backend::Systemd { unit, .. } => systemctl(&["stop", "--no-block", unit.as_str()]),
+        }
+    }
+
+    /// Démarre / arrête le conteneur AMP de l'instance (rien à faire en systemd).
+    fn start_host(&mut self) -> Result<()> {
+        match self {
+            Backend::Amp { ads, instance, .. } => ads
+                .call_with("ADSModule/StartInstance", serde_json::json!({"InstanceName": instance}))
+                .map(|_| ()),
+            Backend::Systemd { .. } => Ok(()),
+        }
+    }
+
+    fn stop_host(&mut self) -> Result<()> {
+        match self {
+            Backend::Amp { amp, ads, instance } => {
+                amp.session = None;
+                ads.call_with("ADSModule/StopInstance", serde_json::json!({"InstanceName": instance}))
+                    .map(|_| ())
+            }
+            Backend::Systemd { .. } => Ok(()),
+        }
+    }
+
+    fn reset_session(&mut self) {
+        if let Backend::Amp { amp, .. } = self {
+            amp.session = None;
+        }
+    }
+
+    fn is_amp(&self) -> bool {
+        matches!(self, Backend::Amp { .. })
+    }
+}
+
+fn systemctl(args: &[&str]) -> Result<()> {
+    let st = std::process::Command::new("systemctl").args(args).status()?;
+    if st.success() {
+        Ok(())
+    } else {
+        bail!("systemctl {} : code {st}", args.join(" "))
+    }
+}
+
 /// Boucle de supervision d'un serveur : suit l'état AMP, démarre sur demande, arrête si inactif.
 fn supervisor(
     srv: Arc<Server>,
     ready_tx: watch::Sender<bool>,
     nudge: std::sync::mpsc::Receiver<()>,
-    ads_url: String,
-    user: String,
-    password: String,
+    mut backend: Backend,
 ) {
     let name = srv.cfg.name.clone();
     let log = |m: String| log(format!("[{name}] {m}"));
-    // Instance (via le proxy ADS) et ADS lui-même, avec le même compte.
-    let mut amp = Amp {
-        url: format!("{ads_url}ADSModule/Servers/{}/API/", srv.cfg.instance_id),
-        user: user.clone(),
-        password: password.clone(),
-        session: None,
-    };
-    let mut ads = Amp { url: ads_url, user, password, session: None };
     let mut ready_since: Option<Instant> = None;
     let mut last_start_cmd: Option<Instant> = None;
     let mut last_ads_start: Option<Instant> = None;
@@ -757,19 +854,17 @@ fn supervisor(
         if waking {
             idle_stopped = false;
         }
-        let res = amp.state();
+        let res = backend.state();
         let last_amp_state = res.as_ref().ok().copied();
         match res {
             Ok(st) => {
                 if idle_stopped && st == 0 {
                     idle_stopped = false;
-                    if srv.cfg.stop_instance_when_idle {
+                    if srv.cfg.stop_instance_when_idle && backend.is_amp() {
                         log("serveur arrêté : extinction du conteneur AMP".to_string());
-                        let body = serde_json::json!({"InstanceName": srv.cfg.instance_name});
-                        if let Err(e) = ads.call_with("ADSModule/StopInstance", body) {
+                        if let Err(e) = backend.stop_host() {
                             log(format!("échec ADSModule/StopInstance : {e:#}"));
                         }
-                        amp.session = None;
                     }
                 }
                 // 20 = Ready ; 0 = Stopped ; 100 = Failed
@@ -801,10 +896,10 @@ fn supervisor(
 
                 let recently = last_start_cmd.is_some_and(|t| t.elapsed() < Duration::from_secs(60));
                 if waking && (st == 0 || st == 100) && !recently {
-                    log(format!("démarrage du serveur (état AMP {st})"));
-                    match amp.call("Core/Start") {
+                    log(format!("démarrage du serveur (état {st})"));
+                    match backend.start() {
                         Ok(_) => last_start_cmd = Some(Instant::now()),
-                        Err(e) => log(format!("échec Core/Start : {e:#}")),
+                        Err(e) => log(format!("échec du démarrage : {e:#}")),
                     }
                 }
 
@@ -813,9 +908,9 @@ fn supervisor(
                     let quiet = srv.last_activity.lock().unwrap().elapsed();
                     if quiet >= Duration::from_secs(idle * 60) {
                         log(format!("aucun joueur depuis {idle} min : arrêt du serveur"));
-                        match amp.call("Core/Stop") {
+                        match backend.stop() {
                             Ok(_) => idle_stopped = true,
-                            Err(e) => log(format!("échec Core/Stop : {e:#}")),
+                            Err(e) => log(format!("échec de l'arrêt : {e:#}")),
                         }
                         srv.touch();
                     }
@@ -824,18 +919,17 @@ fn supervisor(
             Err(e) => {
                 ready_since = None;
                 ready_tx.send_if_modified(|r| std::mem::replace(r, false));
-                amp.session = None;
+                backend.reset_session();
                 // L'instance AMP elle-même (son conteneur) est arrêtée : on la démarre via ADS.
                 let recently = last_ads_start.is_some_and(|t| t.elapsed() < Duration::from_secs(90));
-                if waking && !recently {
+                if waking && !recently && backend.is_amp() {
                     log(format!("instance AMP indisponible ({e:#}) : démarrage via ADS"));
-                    let body = serde_json::json!({"InstanceName": srv.cfg.instance_name});
-                    if let Err(e) = ads.call_with("ADSModule/StartInstance", body) {
+                    if let Err(e) = backend.start_host() {
                         log(format!("échec ADSModule/StartInstance : {e:#}"));
                     }
                     last_ads_start = Some(Instant::now());
                 } else if !waking && last_error_log.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
-                    log(format!("API AMP indisponible : {e:#}"));
+                    log(format!("état du serveur illisible : {e:#}"));
                     last_error_log = Some(Instant::now());
                 }
             }
@@ -866,10 +960,16 @@ fn supervisor(
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/reveilleur/reveilleur.toml".into());
     let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).with_context(|| path.clone())?)?;
-    let password = std::fs::read_to_string(&cfg.amp_password_file)
-        .context("mot de passe AMP illisible")?
-        .trim()
-        .to_string();
+    // Le mot de passe AMP n'est nécessaire que si au moins un serveur passe par AMP.
+    let needs_amp = cfg.servers.iter().any(|s| s.systemd_unit.is_none());
+    let password = if needs_amp {
+        std::fs::read_to_string(&cfg.amp_password_file)
+            .context("mot de passe AMP illisible")?
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
 
     let mut by_name: HashMap<String, Arc<Server>> = HashMap::new();
     for s in cfg.servers {
@@ -891,8 +991,32 @@ fn main() -> Result<()> {
             last_activity: Mutex::new(Instant::now()),
             favicon,
         });
-        let (sup, ads, user, pw) = (srv.clone(), cfg.ads_url.clone(), cfg.amp_user.clone(), password.clone());
-        std::thread::spawn(move || supervisor(sup, ready_tx, nudge_rx, ads, user, pw));
+        let backend = match &srv.cfg.systemd_unit {
+            Some(unit) => {
+                let log_file = srv.cfg.log_file.clone().unwrap_or_else(|| {
+                    format!("/home/amp/.ampdata/instances/{}/Minecraft/logs/latest.log", srv.cfg.instance_name)
+                });
+                log(format!("[{}] pilotage par systemd ({unit})", srv.cfg.name));
+                Backend::Systemd { unit: unit.clone(), log_file }
+            }
+            None => Backend::Amp {
+                amp: Amp {
+                    url: format!("{}ADSModule/Servers/{}/API/", cfg.ads_url, srv.cfg.instance_id),
+                    user: cfg.amp_user.clone(),
+                    password: password.clone(),
+                    session: None,
+                },
+                ads: Amp {
+                    url: cfg.ads_url.clone(),
+                    user: cfg.amp_user.clone(),
+                    password: password.clone(),
+                    session: None,
+                },
+                instance: srv.cfg.instance_name.clone(),
+            },
+        };
+        let sup = srv.clone();
+        std::thread::spawn(move || supervisor(sup, ready_tx, nudge_rx, backend));
         by_name.insert(srv.cfg.name.clone(), srv);
     }
 

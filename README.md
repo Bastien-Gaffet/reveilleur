@@ -101,6 +101,24 @@ réveilleur déclenche le réveil et le déconnecte avec « Le serveur X démarr
   défaut) : environ 260 à 300 Mo libérés par serveur endormi. Le réveil
   rallume le conteneur (une dizaine de secondes de plus).
 
+## Mode systemd (sans AMP)
+
+Pour un serveur qui n'utilise pas AMP (après une migration, voir le dépôt
+`migration-serveur`), ajouter dans sa section `[[servers]]` :
+
+```toml
+systemd_unit = "minecraft@PCSI201"
+# log_file = "..."  (par défaut : /home/amp/.ampdata/instances/<instance_name>/Minecraft/logs/latest.log)
+```
+
+Le réveilleur démarre et arrête alors l'unité systemd (`systemctl start/stop
+--no-block`) et considère le serveur **prêt quand l'unité est active ET que son
+journal contient « Done ( »** : Minecraft ouvre son port avant d'avoir chargé le
+monde, un transfert trop tôt échouerait. Les champs AMP (`ads_url`, `amp_user`,
+`amp_password_file`, `instance_id`) deviennent inutiles si aucun serveur ne passe
+par AMP. Testé sur un banc d'essai (faux serveur sous systemd) : réveil, attente
+de « Done », état publié, arrêt après inactivité.
+
 ## Configuration
 
 `deploy/reveilleur.toml.example` (sur le VPS : `/etc/reveilleur/reveilleur.toml`).
