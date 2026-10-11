@@ -1,0 +1,6 @@
+# Fichiers exécutés sous Linux : fins de ligne LF, même extraits sous Windows.
+* text=auto eol=lf
+*.png binary
+*.jar binary
+*.docx binary
+*.zip binary
